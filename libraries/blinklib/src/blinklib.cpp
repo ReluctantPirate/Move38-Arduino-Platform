@@ -25,7 +25,6 @@
 
 #include "blinklib.h"
 #include "blinkstate.h"			// Get the reference to beginBlinkState()
-#include "chainfunction.h"
 
 #include "pixel.h"
 #include "timer.h"
@@ -63,10 +62,16 @@
 
 #define BUTTON_LONGPRESS_TIME_MS 2000          // How long you must hold button down to register a long press.
 
-//#warning sleepy blinks cant stay up more than 10 seconds
-//#define BUTTON_SLEEP_TIMEOUT_SECONDS (10)   // If no button press in this long then goto sleep
+#define SLEEP_TIMEOUT_SECONDS (10*60)          // If no button press in this long then goto sleep
 
-#define BUTTON_SLEEP_TIMEOUT_SECONDS (10*60)   // If no button press in this long then goto sleep
+#define SLEEP_TIMEOUT_MS ( (unsigned long) SLEEP_TIMEOUT_SECONDS  * MILLIS_PER_SECOND) // Must cast up becuase otherwise will overflow
+
+
+// When we should fall sleep from inactivity
+Timer sleepTimer;
+
+
+//#define BUTTON_SLEEP_TIMEOUT_SECONDS (10*60)   // If no button press in this long then goto sleep
 
 // PIXEL FUNCTIONS
 
@@ -76,7 +81,8 @@
 // sure that the final result of any loop() interation will always hit the display for at least
 // one frame to eliminate aliasing and tearing.
 
-void setFaceColor( byte face , Color newColor ) {
+
+void setColorOnFace( Color newColor , byte face ) {
 
     pixelColor_t newPixelColor;
 
@@ -93,39 +99,42 @@ void setFaceColor( byte face , Color newColor ) {
 
 }
 
+void setFaceColor( byte face , Color newColor ) {
+    setColorOnFace( newColor , face );
+}
+
 // Convenience function to set all pixels to the same color.
 
 void setColor( Color newColor ) {
 
     FOREACH_FACE(f) {
-        setFaceColor( f , newColor );
+        setColorOnFace( newColor, f );
     }
 
 }
 
-
 // This maps 0-255 values to 0-31 values with the special case that 0 (in 0-255) is the only value that maps to 0 (in 0-31)
 // This leads to some slight non-linearity since there are not a uniform integral number of 1-255 values
-// to map to each of the 1-31 values. 
+// to map to each of the 1-31 values.
 
 byte map8bitTo5bit( byte b ) {
-    
-    if (b==0) return 0; 
-        
+
+    if (b==0) return 0;
+
     // 0 gets a special case of `off`, so we divide the rest of the range in to
-    // 31 equaly spaced regions to assign the remaing 31 brightness levels. 
-    
+    // 31 equaly spaced regions to assign the remaing 31 brightness levels.
+
     uint16_t normalizedB = b-1;     // Offset to a value 0-254 that will be scaled to the remaining 31 on values
-    
+
     //uint16_t scaledB = (normalizedB / 255) * 31); // This is what we want to say, but it will underflow in integer math
-    
+
     byte scaledB = ( (uint16_t) normalizedB * 31U) / 255U; // Be very careful to stay in bounds!
-    
+
     // scaledB is now a number 0-30 that is (almost) lenearly scaled down from the orginal b
-        
-    return ( scaledB )+1;       // De-normalize back up to `on` values 1-31. 
-    
-}    
+
+    return ( scaledB )+1;       // De-normalize back up to `on` values 1-31.
+
+}
 
 // Make a new color from RGB values. Each value can be 0-255.
 
@@ -198,49 +207,49 @@ Color makeColorHSB( uint8_t hue, uint8_t saturation, uint8_t brightness ) {
 #define GETNEXTRANDUINT_MAX UINT16_MAX
 
 static uint16_t GetNextRandUint(void) {
-    
+
     // These values are not magical, just the default values Marsaglia used.
     // Any unit should work.
-    
+
     // We make them local static so that we only consume the storage if the random()
-    // functions are actually ever called. 
-    
+    // functions are actually ever called.
+
     static uint32_t u = 521288629UL;
     static uint32_t v = 362436069UL;
-    
+
     v = 36969*(v & 65535) + (v >> 16);
     u = 18000*(u & 65535) + (u >> 16);
-    
+
     return (v << 16) + u;
-    
-}    
+
+}
 
 // return a random number between 0 and limit inclusive.
 // TODO: Use entropy from the button or decaying IR LEDs
 // https://stackoverflow.com/a/2999130/3152071
 
 uint16_t rand( uint16_t limit ) {
-       
+
     uint16_t divisor = GETNEXTRANDUINT_MAX/(limit+1);
     uint16_t retval;
 
-    do { 
+    do {
         retval = GetNextRandUint() / divisor;
     } while (retval > limit);
 
     return retval;
-}    
+}
 
 // Returns the number of millis since last call
 // Handy for profiling.
 
 uint32_t timeDelta(void) {
     static uint32_t lastcall=0;
-    uint32_t now = millis();    
-    uint32_t delta = now - lastcall;    
+    uint32_t now = millis();
+    uint32_t delta = now - lastcall;
     lastcall = now;
     return delta;
-}    
+}
 
 // Read the unique serial number for this blink tile
 // There are 9 bytes in all, so n can be 0-8
@@ -270,39 +279,40 @@ byte getSerialNumberByte( byte n ) {
 // If the cycle ends with the button down, then we interpret this that the user wanted to
 // abort the clicks, so we discard the count.
 
-static volatile bool buttonState=0;                     // Current debounced state
+static volatile byte buttonState=0;                     // Current debounced state
 
-static volatile bool buttonPressedFlag=0;               // Has the button been pressed since the last time we checked it?
-static volatile bool buttonReleasedFlag=0;                // Has the button been lifted since the last time we checked it?
+static volatile byte buttonPressedFlag=0;               // Has the button been pressed since the last time we checked it?
+static volatile byte buttonReleasedFlag=0;              // Has the button been lifted since the last time we checked it?
 
 static uint8_t buttonDebounceCountdown=0;               // How long until we are done bouncing. Only touched in the callback
+                                                        // Set to BUTTON_DEBOUNCE_MS every time we see a change, then we ignore everything
+                                                        // until it gets to 0 again
 
 static uint16_t clickWindowCountdown=0;                 // How long until we close the current click window. 0=done TODO: Make this 8bit by reducing scan rate.
 static uint8_t clickPendingcount=0;                     // How many clicks so far int he current click window
 
 static uint16_t longPressCountdown=0;                   // How long until the current press becomes a long press
 
-static volatile bool singleClickedFlag=0;               // single click since the last time we checked it?
-static volatile bool doubleClickedFlag=0;               // double click since the last time we checked it?
-static volatile bool multiClickedFlag=0;                // multi click since the last time we checked it?
+static volatile byte singleClickedFlag=0;               // single click since the last time we checked it?
+static volatile byte doubleClickedFlag=0;               // double click since the last time we checked it?
+static volatile byte multiClickedFlag=0;                // multi click since the last time we checked it?
 
-static volatile bool longPressFlag=0;                   // Has the button been long pressed since the last time we checked it?
+static volatile byte longPressFlag=0;                   // Has the button been long pressed since the last time we checked it?
 
 static volatile uint8_t maxCompletedClickCount=0;       // Remember the most completed clicks to support the clickCount() function
 
-#define BUTTON_SLEEP_TIMEOUT_MS ( BUTTON_SLEEP_TIMEOUT_SECONDS * (unsigned long) MILLIS_PER_SECOND)
 
-static volatile unsigned long buttonSleepTimout=BUTTON_SLEEP_TIMEOUT_MS;
-                                                        // we sleep when millis() >= buttonSleepTimeout
-                                                        // Here we assume that millis() starts at 0 on power up
+static volatile uint8_t buttonChangeFlag = 1;           // Set anytime the button changes state. Used to reset the sleep timer in the foreground.
+                                                        // Init to 1 so that we reset the sleep timer on startup.
 
 // Called once per tick by the timer to check the button position
 // and update the button state variables.
 
 // Note: this runs in Callback context in the timercallback
+// Called every 1ms
 
-static void updateButtonState(void) {
 
+static void updateButtonState1ms(void) {
 
     bool buttonPositon = button_down();
 
@@ -326,7 +336,7 @@ static void updateButtonState(void) {
                 }
             }
 
-            // We can nestle thew click window countdown in here because a click will ALWAYS happen inside a long press...
+            // We can nestle the click window countdown in here because a click will ALWAYS happen inside a long press...
 
             if (clickWindowCountdown) {
 
@@ -367,6 +377,8 @@ static void updateButtonState(void) {
 
         if (!buttonDebounceCountdown) {         // Done bouncing
 
+            buttonChangeFlag = 1;               // Signal to foreground that something happened on the button
+
             buttonState = buttonPositon;
 
             if (buttonPositon) {
@@ -376,10 +388,8 @@ static void updateButtonState(void) {
                     clickPendingcount++;
                 }
 
-                clickWindowCountdown = TIMER_MS_TO_TICKS( BUTTON_CLICK_TIMEOUT_MS );
-                longPressCountdown   = TIMER_MS_TO_TICKS( BUTTON_LONGPRESS_TIME_MS );
-
-                buttonSleepTimout = millis() + BUTTON_SLEEP_TIMEOUT_MS;        // Button pressed, so restart the sleep countdown
+                clickWindowCountdown = BUTTON_CLICK_TIMEOUT_MS ;
+                longPressCountdown   = BUTTON_LONGPRESS_TIME_MS;
 
             } else {
                 buttonReleasedFlag=1;
@@ -388,7 +398,7 @@ static void updateButtonState(void) {
 
         // Restart the countdown anytime the button position changes
 
-        buttonDebounceCountdown = TIMER_MS_TO_TICKS( BUTTON_DEBOUNCE_MS );
+        buttonDebounceCountdown = BUTTON_DEBOUNCE_MS;
 
     }
 
@@ -420,7 +430,7 @@ bool buttonDown(void) {
 55c:	08 95       	ret
 */
 
-bool testAndClearFlag( volatile bool &flag ) {
+bool testAndClearFlag( volatile byte &flag ) {
 
 if ( flag ) {
     flag=false;
@@ -478,26 +488,14 @@ uint8_t buttonClickCount(void) {
     return t;
 }
 
-void button_callback_onChange(void) {
-    // Empty since we do not need to do anything in the interrupt with the above timer sampling scheme.
-    // Nice because bounces can come fast and furious.
-}
-
-
-// TODO: Need this?
-
-volatile uint8_t verticalRetraceFlag=0;     // Turns to 1 when we are about to start a new refresh cycle at pixel zero
-// Once this turns to 1, you have about 2ms to load new values into the raw array
-// to have them displayed in the next frame.
-// Only matters if you want to have consistent frames and avoid visual tearing
-// which might not even matter for this application at 80hz
-// TODO: Is this empirically necessary?
-
 
 // Will overflow after about 62 days...
 // https://www.google.com/search?q=(2%5E31)*2.5ms&rlz=1C1CYCW_enUS687US687&oq=(2%5E31)*2.5ms
 
-static volatile uint32_t millisCounter=0;           // How many milliseconds since startup?
+static volatile uint32_t millisCounter=1;           // How many milliseconds since startup?
+                                                    // We begin at 1 so that the comparison `0 < mills() `
+                                                    // will always be true so we can use `0` time to semantically
+                                                    // mean `always in the past.
 
 // Overflows after about 60 days
 // Note that resolution is limited by timer tick rate
@@ -505,60 +503,75 @@ static volatile uint32_t millisCounter=0;           // How many milliseconds sin
 // TODO: Clear out millis to zero on wake
 
 // This snapshot makes sure that we always see the same value for millis() in a given iteration of loop()
-// This "freeze-time" view makes it harder to have race conditions when millis() changes while you are looking at it. 
-// The value of millis_snapshot gets reset to 0 after each loop() iteration. 
+// This "freeze-time" view makes it harder to have race conditions when millis() changes while you are looking at it.
+// The value of millis_snapshot gets reset to 0 after each loop() iteration.
 
-static uint32_t millis_snapshot=0; 
+static uint32_t millis_snapshot;
+
+// Need not be atomic since never called from the background.
+
+static void updateMillis(void) {
+
+	millis_snapshot = millisCounter;
+
+}
 
 unsigned long millis(void) {
-	
-	if (millis_snapshot) {				// Did we already compute this for this pass of loop()?
-		return millis_snapshot;	
-	}
-
-    uint32_t tempMillis;
-
-    // millisCounter is 4 bytes long and is updated in the background
-    // so we need an atomic block to make sure it does not change while we are reading it
-
-    DO_ATOMICALLY {
-        tempMillis=millisCounter;
-    }
-	
-	millis_snapshot = tempMillis;
-	
-    return( tempMillis );
+    return( millis_snapshot );
 }
 
 // Note we directlyt access millis() here, which is really bad style.
-// The timer should capture millis() in a closure, but no good way to 
-// do that in C++ that is not verbose and inefficient, so here we are. 
+// The timer should capture millis() in a closure, but no good way to
+// do that in C++ that is not verbose and inefficient, so here we are.
 
 bool Timer::isExpired() {
-	return millis() >= m_expireTime; 
+	return millis() >= m_expireTime;
 }
-	
+
 void Timer::set( uint32_t ms ) {
-	m_expireTime= millis()+ms;	
+	m_expireTime= millis()+ms;
+}
+
+uint32_t Timer::getRemaining() {
+
+  uint32_t timeRemaining;
+
+  if( millis() >= m_expireTime) {
+
+    timeRemaining = 0;
+
+  } else {
+
+    timeRemaining = m_expireTime - millis();
+
+  }
+
+  return timeRemaining;
+
 }
 
 void Timer::add( uint16_t ms ) {
-	m_expireTime+= ms;
+
+    // Check to avoid overflow
+
+    uint32_t timeLeft = NEVER - m_expireTime;
+
+    if (ms > timeLeft ) {
+
+        m_expireTime = NEVER;
+
+    } else {
+
+	    m_expireTime+= ms;
+
+    }
+}
+
+void Timer::never(void) {
+    m_expireTime=NEVER;
 }
 
 
-/*
-
-// Delay for `ms` milliseconds
-
-void delay( unsigned long ms ) {
-
-    unsigned long endtime = millis() + ms;
-
-    while (millis() < endtime);
-
-}
-*/
 
 // TODO: This is accurate and correct, but so inefficient.
 // We can do better.
@@ -570,30 +583,14 @@ void delay( unsigned long ms ) {
 
 // __uint24 timer24;
 
-static uint16_t cyclesCounter=0;                    // Accumulate cycles to keep millisCounter accurate
-
 #define BLINKCORE_UINT16_MAX (0xffff)               // I can not get stdint.h to work even with #define __STDC_LIMIT_MACROS, so have to resort to this hack.
 
 
-#if TIMER_CYCLES_PER_TICK >  BLINKCORE_UINT16_MAX
-    #error Overflow on cyclesCounter
-#endif
-
 // Note this runs in callback context
 
-static void updateMillis(void) {
+static void incrementMillis1ms(void) {
 
-    cyclesCounter+=TIMER_CYCLES_PER_TICK;    // Used for timekeeping. Nice to increment here since this is the least time consuming phase
-
-    while (cyclesCounter >= CYCLES_PER_MS  ) {      // While covers cases where TIMER_CYCLES_PER_TICK >= CYCLES_PER_MILLISECOND * 2
-
-        millisCounter++;
-        cyclesCounter-=CYCLES_PER_MS ;
-
-    }
-
-    // Note that we might have some cycles left. They will accumulate in cycles counter and eventually get folded into a full milli to
-    // avoid errors building up.
+    millisCounter++;
 
 }
 
@@ -618,7 +615,7 @@ uint8_t hasWoken(void) {
 
 // Turn off everything and goto to sleep
 
-void sleep(void) {
+static void sleep(void) {
 
     pixel_disable();        // Turn off pixels so battery drain
     ir_disable();           // TODO: Wake on pixel
@@ -634,48 +631,36 @@ void sleep(void) {
 
 }
 
-// Time to sleep? (No button presses recently?)
+// Called about once every 1ms
 
-void checkSleepTimeout(void) {
+#include "sp.h"
 
-    if ( millis() >= buttonSleepTimout) {
-        sleep();
-    }
+void timer_1000us_callback_sei(void) {
+
+    incrementMillis1ms();
+    updateButtonState1ms();
 
 }
 
-// This is called by about every 512us with interrupts on. 
-
-void timer_512us_callback_sei(void) {
-    updateMillis();
-    updateButtonState();
-    checkSleepTimeout();
-}
-
-// This is called by about every 256us with interrupts on. 
+// This is called by timer ISR about every 512us with interrupts on.
 
 void timer_256us_callback_sei(void) {
-    updateIRComs();
+
+    // Decrementing slightly more efficient because we save a compare.
+    static unsigned step_us=0;
+
+    step_us += 256;                     // 256us between calls
+
+    if ( step_us>= 1000 ) {             // 1000us in a 1ms
+        timer_1000us_callback_sei();
+        step_us-=1000;
+    }
 }
 
+// This is called by timer ISR about every 256us with interrupts on.
 
-static chainfunction_struct *onLoopChain = NULL;
-
-// Call all the functions on the chain (if any)...
-
-static void callOnLoopChain(void ) {
-
-    chainfunction_struct *c = onLoopChain;
-
-    while (c) {
-
-
-        c->callback();
-
-        c= c->next;
-
-    }
-
+void timer_128us_callback_sei(void) {
+    IrDataPeriodicUpdateComs();
 }
 
 // This is the entry point where the blinkcore platform will pass control to
@@ -684,35 +669,42 @@ static void callOnLoopChain(void ) {
 // We make this weak so that a game can override and take over before we initialize all the hier level stuff
 
 void __attribute__ ((weak)) run(void) {
-	
-	// Let blinkstate sink its hooks in
-	blinkStateBegin();
 
+	// Let blinkstate sink its hooks in
+	blinkStateSetup();
+
+    // Call user setup code
     setup();
 
     while (1) {
+
+        updateMillis();                     // The millis() function only offers a snapshot so that
+                                            // we always get the same value no matter when we look inside
+                                            // a single loop iteration.
+
 
         loop();
 
         pixel_displayBufferedPixels();      // show all display updates that happened in last loop()
                                             // Also currently blocks until new frame actually starts
 
-        callOnLoopChain();
-		
-		millis_snapshot=0;					// Clear out so we get an updated value next pass
+        blinkStateLoop();                 // Process any received IR messages.
 
-        // TODO: Sleep here
+        if (buttonChangeFlag) {
+
+            buttonChangeFlag = 0;
+
+            sleepTimer.set( SLEEP_TIMEOUT_MS );
+
+        }
+
+        if (sleepTimer.isExpired()) {
+            sleep();
+
+        }
+
+        // He we could add a delay rather than call loop() as quickly as possible. This could lower power.
 
     }
-
-}
-
-// Add a function to be called after each pass though loop()
-// `cons` onto the linked list of functions
-
-void addOnLoop( chainfunction_struct *chainfunction ) {
-
-    chainfunction->next = onLoopChain;
-    onLoopChain = chainfunction;
 
 }

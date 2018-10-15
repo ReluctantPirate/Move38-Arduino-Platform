@@ -24,9 +24,9 @@
 
 #include <stddef.h>
 
-#include "blinklib.h"
+#include "irdata.h"
 
-#include "chainfunction.h"
+#include "blinklib.h"
 
 // Tell blinkstate.h to save the IR functions just for us...
 
@@ -42,7 +42,7 @@
 
 // Last received value on this face, or 0 if no neighbor ever seen since startup
 
-static byte inValue[FACE_COUNT];               
+static byte inValue[FACE_COUNT];
 
 // Value we send out on this face
 
@@ -66,46 +66,115 @@ static uint32_t neighboorSendTime[FACE_COUNT];      // inits to 0 on startup, so
 static const uint16_t sendprobeDurration_ms = 200;
 
 
-
 // check and see if any states recently updated....
+
+#if IR_DATA_VALUE_MAX >= (1<<6)
+    #error You cant change the max value without changing the code below to not use the top two bits for multiplexing packet types!
+#endif
 
 static void updateIRFaces(uint32_t now) {
 
     FOREACH_FACE(f) {
-        
-        // Check for anything new coming in...
 
-        if (irIsReadyOnFace(f)) {
+        // Check for anything new coming in...
         
+        if (irDataIsPacketReady(f)) {
+
             // Got something, so we know there is someone out there
+            // TODO: Should we require the received packet to pass error checks?
             expireTime[f] = now + expireDurration_ms;
-        
-            // Clear to send on this face immediately to ping-pong messages at max speed without collisions
-            neighboorSendTime[f] = 0;
-        
-            byte receivedMessage = irGetData(f);
             
-            inValue[f] = receivedMessage;
-        
-        }
-        
-        // Send out if it is time....
-        
-        if ( neighboorSendTime[f] <= now ) {        // Time to send on this face?
-        
-            irSendData( f , outValue[f]  );
+            const byte *packetBuffer = irDataPacketBuffer(f);
+            
+            
+            if ( packetBuffer[0] <= IR_DATA_VALUE_MAX ) {
+                
+                // If the top two bits of the packet header byte are 0, then this is a user face value
+                // We special case this out to keep the refresh rates up.
+                // In this case, the packet should only be 2 bytes long
+                // and the 2nd byte is the invert of the first for error checking
+
+
+                // If packet is not 2 bytes long then we have a problem
+                
+                if ( irDataPacketLen( f ) == 2 ) {
                     
+                    // We error check these special packets by sending the 2nd byte as the invert of the first
+                    
+                    byte data = packetBuffer[0];
+                    byte invert = packetBuffer[1];
+                    
+                    if ( data == ((byte) (~invert)) ) {
+                        
+                        // OK, everything checks out, we got a good face value!
+                        
+                        inValue[f] = data;
+                        
+                        // Clear to send on this face immediately to ping-pong messages at max speed without collisions
+                        neighboorSendTime[f] = 0;                                                
+                        
+                    }                                
+                    
+                }                    
+                                
+            } else {
+                
+                // Some other kind of packet received
+                               
+                
+            }                                
+            
+            irDataMarkPacketRead( f );
+
+        }
+
+        // Send one out too if it is time....
+
+        if ( neighboorSendTime[f] <= now ) {        // Time to send on this face?
+            
+            byte packetBuffer[2];
+            
+            byte data = outValue[f];
+                       
+            // TODO: Check the asm on this casted inversion
+            packetBuffer[0] = data;            
+            packetBuffer[1] = (byte) (~data);          // Invert byte as an error check for face values 
+
+            irSendData( f , packetBuffer , 2 );
+
             // Here we set a timeout to keep periodically probing on this face, but
             // if there is a neighbor, they will send back to us as soon as they get what we
             // just transmitted, which will make us immediately send again. So the only case
             // when this probe timeout will happen is if there is no neighbor there.
-        
+
             neighboorSendTime[f] = now + sendprobeDurration_ms;
-        }        
-                
+        }
+
     }
 
 }
+
+
+static uint8_t enabled;
+
+
+void blinkStateEnable(void) {
+    enabled = 1;
+}
+
+void blinkStateDisable(void) {
+    enabled = 0;
+}
+
+
+void blinkStateSetup(void) {
+
+    // Blinkstate is enabled by default
+    blinkStateEnable();
+
+}
+
+
 
 // Called one per loop() to check for new data and repeat broadcast if it is time
 // Note that if this is not called frequently then neighbors can appear to still be there
@@ -115,45 +184,17 @@ static void updateIRFaces(uint32_t now) {
 // TODO: All these calls to millis() and subsequent calculations are expensive. Cache stuff and reuse.
 // TODO: now will come as an arg soon with freeze-time branch
 
-void blinkStateOnLoop(void) {
-    
-    uint32_t now = millis(); 
-    
-    updateIRFaces(now); 
-    
+void blinkStateLoop(void) {
 
-}
+    if (enabled) {
 
-// Make a record to add to the callback chain
+        uint32_t now = millis();
 
-static struct chainfunction_struct blinkStateOnLoopChain = {
-     .callback = blinkStateOnLoop,
-     .next     = NULL                  // This is a waste because it gets overwritten, but no way to make this un-initialized in C
-};
+        updateIRFaces(now);
 
-// Something tricky here:  I can not find a good place to automatically add
-// our onLoop() hook at compile time, and we
-// don't want to follow idiomatic Arduino ".begin()" pattern, so we
-// hack it by adding here the first time anything that could use state
-// stuff is called. This is an ugly hack. :/
-
-// TODO: This is a good place for a GPIO register bit. Then we could inline the test to a single instruction.,
-
-static uint8_t hookRegisteredFlag=0;        // Did we already register?
-
-static void registerHook(void) {
-    if (!hookRegisteredFlag) {
-        addOnLoop( &blinkStateOnLoopChain );
-        hookRegisteredFlag=1;
     }
+
 }
-
-// Manually add our hooks
-
-void blinkStateBegin(void) {
-    registerHook();
-}
-
 
 // Returns the last received state on the indicated face
 // Remember that getNeighborState() starts at 0 on powerup.
@@ -162,90 +203,102 @@ void blinkStateBegin(void) {
 // Note the a face expiring has no effect on the getNeighborState()
 
 byte getLastValueReceivedOnFace( byte face ) {
-    
+
     return inValue[ face ];
 
 }
 
-// Did the neighborState value on this face change since the 
+// Did the neighborState value on this face change since the
 // last time we checked?
-// Remember that getNeighborState starts at 0 on powerup. 
+// Remember that getNeighborState starts at 0 on powerup.
 // Note the a face expiring has no effect on the getNeighborState()
 
 byte didValueOnFaceChange( byte face ) {
     static byte prevState[FACE_COUNT];
-    
+
     byte curState = getLastValueReceivedOnFace(face);
-    
+
     if ( curState == prevState[face] ) {
         return false;
     }
     prevState[face] = curState;
-    
-    return true; 
-    
-}    
+
+    return true;
+
+}
 
 // 0 if no messages recently received on the indicated face
 // (currently configured to 100ms timeout in `expireDurration_ms` )
 
 static byte isValueReceivedOnFaceExpired( byte face , uint32_t now ) {
-    
+
     return expireTime[face] < now;
-        
-}    
+
+}
 
 
 // 0 if no messages recently received on the indicated face
 // (currently configured to 100ms timeout in `expireDurration_ms` )
 
 byte isValueReceivedOnFaceExpired( byte face ) {
-    
-    uint32_t now=millis(); 
-    
+
+    uint32_t now=millis();
+
     return isValueReceivedOnFaceExpired( face , now );
-    
+
 }
 
-// Returns false if their has been a neighbor seen recently on any face, true otherwise. 
+// Returns false if their has been a neighbor seen recently on any face, true otherwise.
 
 bool isAlone() {
-	
+
 	FOREACH_FACE(f) {
-		
+
 		if( !isValueReceivedOnFaceExpired(f) ) {
 			return false;
 		}
-		
+
 	}
 	return true;
-	
+
 }
 
 
-// Set our broadcasted state on all faces to newState. 
+// Set our broadcasted state on all faces to newState.
 // This state is repeatedly broadcast to any neighboring tiles.
 
 // By default we power up in state 0.
 
-void setValueSentOnAllFaces( byte newState ) {
+void setValueSentOnAllFaces( byte value ) {
     
+     if (value > IR_DATA_VALUE_MAX ) {
+
+         value = IR_DATA_VALUE_MAX;
+
+     }    
+
     FOREACH_FACE(f) {
-        
-        outValue[f] = newState;
-        
+
+        outValue[f] = value;
+
     }
-    
-}            
+
+}
 
 // Set our broadcasted state on indicated face to newState.
 // This state is repeatedly broadcast to the partner tile on the indicated face.
 
 // By default we power up in state 0.
 
-void setValueSentOnFace( byte newState , byte face ) {
-    
-    outValue[face] = newState;
-    
+void setValueSentOnFace( byte value , byte face ) {
+
+     if (value > IR_DATA_VALUE_MAX ) {
+
+         value = IR_DATA_VALUE_MAX;
+
+     }
+
+    outValue[face] = value;
+
 }
 
