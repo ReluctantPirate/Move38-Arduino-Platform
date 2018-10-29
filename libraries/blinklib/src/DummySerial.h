@@ -9,58 +9,69 @@
 
 */
 
-//#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <inttypes.h>
 
-#include "sp.h"
-
-#include "Serial.h"
-
 #include "ArduinoTypes.h"
+
+#ifndef Serial_h
+
+#define Serial_h
+
+#include "Print.h"
+
+class ServicePortSerial : public Print
+{
+
+    public:
+
+    //inline ServicePortSerialSerial(void);
+    void begin(void);
+    void end();
+
+    virtual int available(void);
+
+    // Input buffer is only 1 byte so if an interrupts happens while data is streaming, you will loose any incoming data.
+    // Best to limit yourself interactions with plenty of time (or an ACK) between each incoming byte.
+
+    virtual int read(void);                 // Read a byte - returns byte read or -1 if no byte ready.
+    virtual uint8_t readWait(void);            // Blocking read (faster)
+
+    virtual size_t write(uint8_t);
+    void flush(void);                       // Block until all pending transmits complete
+
+    using Print::write;                     // pull in write(str) and write(buf, size) from Print
+
+
+};
+
+#endif
+
 
 
 // Public Methods //////////////////////////////////////////////////////////////
 
 void ServicePortSerial::begin(void)
 {
-
-  sp_serial_init();
-
 }
 
 void ServicePortSerial::end()
 {
-    // TODO: Is there any reason to turn off the serial port? Power?
-
 }
 
 // We only use the 1 byte hardware buffer
 
-int ServicePortSerial::available(void) {
-
-    if (sp_serial_rx_ready()) {
-        return(1);
-    } else {
+inline int ServicePortSerial::available(void) {
         return(0);
-    }
-
 }
 
-int ServicePortSerial::read(void)
+inline int ServicePortSerial::read(void)
 {
-  if (!sp_serial_rx_ready()) {
     return -1;
-  } else {
-    return sp_serial_rx();
-  }
 }
 
-byte ServicePortSerial::readWait(void)
+inline byte ServicePortSerial::readWait(void)
 {
-    while (!sp_serial_rx_ready());
-    return sp_serial_rx();
+    return 0;
 }
 
 // We don't implement flush because it would require adding a flag to remember if we ever sent.
@@ -68,10 +79,8 @@ byte ServicePortSerial::readWait(void)
 // no TX was ever started. Ardunio does this with the `_writen` flag.
 // If you can convince me that we really need flush, LMK and it can be added.
 
-size_t ServicePortSerial::write(uint8_t c)
+inline size_t ServicePortSerial::write(uint8_t c)
 {
-
-  sp_serial_tx(c);
 
   return(1);
 
@@ -81,5 +90,4 @@ size_t ServicePortSerial::write(uint8_t c)
 
 void ServicePortSerial::flush(void)
 {
-    sp_serial_flush();
 }

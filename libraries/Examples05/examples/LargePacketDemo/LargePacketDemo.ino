@@ -1,4 +1,9 @@
-//#include "debug.h"
+// SplatShare
+// Demonstrates how to send long packets from the blinklib API
+// Pressing the button scrambles the color pattern on the RGB LEDs
+// When the button is released, the scramble is frozen and then the color
+// pattern is shared to neighboors using a packet that contains the RGB
+// values for each of the 6 LEDs. 
 
 // Our currently displayed colors and also the colors we send/receive in a packet to share
 
@@ -14,18 +19,17 @@ byte randomByte() {
 
 Color randomColor() {
 
-    return makeColorHSB( randomByte()  , 255 , 255 );
+    return makeColorHSB( randomByte() , 255 , 255 );
 
 }
 
-//extern uint8_t __vectors;
 
 // Assign a random color to each face
 
 void splat() {
 
     FOREACH_FACE(f){
-        colors[f ] = randomColor();
+        colors[f] = randomColor();
     }
 
 }
@@ -174,7 +178,7 @@ void loop() {
 
     }            //  FOREACH_FACE(f) {
 
-    // Now finally set the outgoing values on each face to reflect the packet state when necessary
+    // Now finally set the outgoing values on each face to reflect the packet state when nessisary
 
     FOREACH_FACE(f) {
 
@@ -190,5 +194,4 @@ void loop() {
     }       // FOREACH_FACE
 
 }           // loop()
-
 
